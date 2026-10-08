@@ -1,0 +1,175 @@
+<!doctype html>
+<!--
+  Minimal reference client for the chat website.
+  Served by the gateway at http://localhost:8080/demo in development.
+
+  Shows the 4 things your real frontend (React/Next.js) needs to do:
+    1. get a login token        (here: dev token; in prod: your auth provider)
+    2. POST /v1/chat with stream:true and read Server-Sent Events via fetch()
+    3. keep conversation_id so follow-ups continue the same chat
+    4. a Stop button that aborts the fetch (the server then cancels model calls = no wasted cost)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Multi-LLM Chat Demo</title>
+<style>
+  :root { --bg:#f6f5f2; --panel:#fff; --text:#1d1d1f; --muted:#6b6b70; --border:#e3e1dc; --accent:#0f766e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#151517; --panel:#1e1e21; --text:#ececee; --muted:#9a9aa1; --border:#2e2e33; --accent:#2dd4bf; } }
+  body { margin:0; font:15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:760px; margin:0 auto; padding:16px; display:flex; flex-direction:column; height:100vh; box-sizing:border-box; }
+  #log { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:12px; padding-bottom:12px; }
+  .msg { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:10px 12px; white-space:pre-wrap; }
+  .user { align-self:flex-end; max-width:80%; }
+  .meta { color:var(--muted); font-size:12px; margin-top:6px; }
+  .progress { color:var(--muted); font-size:13px; }
+  form { display:flex; gap:8px; }
+  textarea { flex:1; resize:none; height:56px; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--panel); color:var(--text); font:inherit; }
+  button { padding:0 16px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--text); border-color:var(--border); }
+  select { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; }
+  .bar { display:flex; gap:8px; align-items:center; margin-bottom:8px; color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="bar">
+    Strategy
+    <select id="strategy">
+      <option value="">plan default</option>
+      <option value="auto">auto</option>
+      <option value="router">router (1 model, cheapest)</option>
+      <option value="parallel">parallel + synthesis</option>
+      <option value="debate">debate</option>
+      <option value="critique">critique</option>
+    </select>
+    <button class="secondary" id="newChat" type="button">New chat</button>
+    <span id="usage"></span>
+  </div>
+  <div id="log"></div>
+  <form id="form">
+    <textarea id="input" placeholder="Ask anything..."></textarea>
+    <button id="send">Send</button>
+    <button id="stop" class="secondary" type="button" hidden>Stop</button>
+  </form>
+</main>
+<script>
+const API = location.origin; // same origin in dev; your API domain in prod
+let token = null;
+let conversationId = null;
+let controller = null;
+
+const $ = (id) => document.getElementById(id);
+
+async function login() {
+  // Replace with your auth provider: e.g. (await supabase.auth.getSession()).data.session.access_token
+  const r = await fetch(`${API}/v1/auth/dev-token`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ user_id: "demo-user" }),
+  });
+  token = (await r.json()).token;
+  refreshUsage();
+}
+
+async function refreshUsage() {
+  const r = await fetch(`${API}/v1/me`, { headers: { authorization: `Bearer ${token}` } });
+  const me = await r.json();
+  $("usage").textContent = `${me.plan.name} plan, ${me.usage.daily_tokens_remaining.toLocaleString()} tokens left today`;
+}
+
+function addMsg(text, cls) {
+  const el = document.createElement("div");
+  el.className = `msg ${cls}`;
+  el.textContent = text;
+  $("log").appendChild(el);
+  el.scrollIntoView({ block: "end" });
+  return el;
+}
+
+async function send(text) {
+  addMsg(text, "user");
+  const bubble = addMsg("", "assistant");
+  const progress = document.createElement("div");
+  progress.className = "progress";
+  bubble.appendChild(progress);
+
+  controller = new AbortController();
+  $("send").hidden = true; $("stop").hidden = false;
+
+  try {
+    const body = { message: text, stream: true, conversation_id: conversationId ?? undefined, strategy: $("strategy").value || undefined };
+    const res = await fetch(`${API}/v1/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!res.ok) { // errors before streaming starts (401, 429, 403...) are plain JSON
+      const err = await res.json();
+      bubble.textContent = err.error.message;
+      return;
+    }
+    // Parse Server-Sent Events from the fetch stream.
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        const event = chunk.match(/^event: (.*)$/m)?.[1];
+        const data = chunk.match(/^data: (.*)$/m)?.[1];
+        if (!event || !data) continue;
+        const payload = JSON.parse(data);
+        if (event === "progress") progress.textContent = describe(payload);
+        if (event === "error") bubble.textContent = payload.error.message;
+        if (event === "done") {
+          conversationId = payload.conversation_id;
+          bubble.textContent = payload.answer;
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.textContent = `${payload.strategy} via ${payload.models.join(", ")}  |  ${payload.usage.total_tokens} tokens, $${payload.usage.cost_usd.toFixed(5)}`;
+          bubble.appendChild(meta);
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === "AbortError") bubble.textContent = "Stopped.";
+    else bubble.textContent = "Network error.";
+  } finally {
+    $("send").hidden = false; $("stop").hidden = true;
+    refreshUsage();
+  }
+}
+
+function describe(e) {
+  switch (e.type) {
+    case "strategy": return `Using ${e.strategy} with ${e.models.length} model(s)...`;
+    case "model_start": return `${e.modelId} is ${e.stage === "answer" ? "thinking" : e.stage + "ing"}...`;
+    case "model_done": return `${e.modelId} ${e.ok ? "done" : "failed"} (${e.stage})`;
+    case "stage": return e.stage === "synthesize" ? "Combining answers..." : `Stage: ${e.stage}, round ${e.round}`;
+    case "consensus": return `Models agreed after round ${e.round}`;
+    case "budget_stop": return "Budget reached, finishing up...";
+    default: return "";
+  }
+}
+
+$("form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const text = $("input").value.trim();
+  if (!text) return;
+  $("input").value = "";
+  send(text);
+});
+$("input").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); $("form").requestSubmit(); }
+});
+$("stop").addEventListener("click", () => controller?.abort());
+$("newChat").addEventListener("click", () => { conversationId = null; $("log").innerHTML = ""; });
+
+login();
+</script>
+</body>
+</html>
