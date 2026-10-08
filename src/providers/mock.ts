@@ -10,6 +10,7 @@
  * which is how the tests check partial-failure handling.
  */
 import { estimateTokens } from "../billing/tokenizer.js";
+import { heuristicDecision } from "../orchestrator/supervisor.js";
 import { ProviderError, type CompletionRequest, type CompletionResult, type LLMProvider } from "./types.js";
 
 export class MockProvider implements LLMProvider {
@@ -28,7 +29,13 @@ export class MockProvider implements LLMProvider {
     }
 
     let text: string;
-    if (lastUser.includes("Classify the request")) {
+    const routing = lastUser.match(/<routing_request>\n([\s\S]*)\n<\/routing_request>/);
+    if (routing) {
+      // Acting as the SUPERVISOR: decide with the same keyword rules the real
+      // fallback uses, so routing in dev behaves like it will with Gemini.
+      const d = heuristicDecision([{ role: "user", content: routing[1]! }]);
+      text = JSON.stringify({ route: d.route, category: d.category, complexity: d.complexity, reason: `mock supervisor: ${d.reason}` });
+    } else if (lastUser.includes("Classify the request")) {
       text = '{"category":"general","complexity":"medium"}';
     } else if (lastUser.includes("NO_ISSUES")) {
       // Critique prompt: mock reviewers are easy to please.

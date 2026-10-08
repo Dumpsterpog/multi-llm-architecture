@@ -1,7 +1,7 @@
 /**
  * Shared types for the orchestration layer.
  */
-import type { ModelSpec } from "../config/models.js";
+import type { ModelSpec, TaskCategory } from "../config/models.js";
 import type { Strategy } from "../config/plans.js";
 import type { ChatMessage, CompletionResult, FinishReason, ProviderName, TokenUsage } from "../providers/types.js";
 import type { Budget } from "./budget.js";
@@ -30,6 +30,14 @@ export interface CallRecord {
  * This is what lets a UI show "Claude is answering... GPT done... synthesising".
  */
 export type OrchestrationEvent =
+  | {
+      type: "supervisor";
+      route: "direct" | "lite" | "standard" | "max";
+      category: string;
+      complexity: string;
+      reason: string;
+      decidedBy: string;
+    }
   | { type: "strategy"; strategy: ConcreteStrategy; models: string[]; aggregator: string }
   | { type: "stage"; stage: string; round: number }
   | { type: "model_start"; stage: string; round: number; modelId: string }
@@ -42,6 +50,9 @@ export interface CallOptions {
   round: number;
   maxOutputTokens: number;
   temperature?: number;
+  /** Per-call overrides of the provider timeout / retry defaults. */
+  timeoutMs?: number;
+  maxRetries?: number;
 }
 
 /** The only way strategies talk to models. Handles budget, retries, events and recording. */
@@ -69,6 +80,8 @@ export interface StrategyInput {
   rounds: number;
   maxOutputTokens: number;
   temperature?: number;
+  /** Already known (from the supervisor): the router skips its own classifier call. */
+  classification?: { category: TaskCategory; complexity: "simple" | "medium" | "complex" };
 }
 
 export interface Candidate {

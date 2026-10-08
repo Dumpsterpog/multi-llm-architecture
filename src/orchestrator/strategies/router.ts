@@ -57,9 +57,10 @@ export function pickModel(pool: ModelSpec[], c: Classification): ModelSpec {
 }
 
 export async function runRouter(input: StrategyInput, ctx: RunContext): Promise<StrategyOutput> {
-  const classification = await classify(input, ctx);
+  // The supervisor has usually classified the message already; don't pay twice.
+  const classification = input.classification ?? (await classify(input, ctx));
   const chosen = pickModel(input.ensemble, classification);
-  const notes = [`Routed as ${classification.category}/${classification.complexity} to ${chosen.id}.`];
+  const notes = [`Answered directly by ${chosen.id} (${classification.category}).`];
 
   // If the chosen model fails, fall back to the next best ones (max 3 attempts).
   const ranked = [chosen, ...input.ensemble.filter((m) => m.id !== chosen.id)].slice(0, 3);

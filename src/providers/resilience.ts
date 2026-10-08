@@ -62,15 +62,26 @@ export class ResilientCaller {
     return !b || b.openUntil <= Date.now();
   }
 
-  async call(provider: LLMProvider, req: CompletionRequest): Promise<CompletionResult> {
+  /**
+   * `override` lets one call use a shorter timeout / fewer retries than the
+   * default. The supervisor uses it: a slow routing decision is worse than a
+   * quick fallback to the heuristic.
+   */
+  async call(
+    provider: LLMProvider,
+    req: CompletionRequest,
+    override: { timeoutMs?: number; maxRetries?: number } = {},
+  ): Promise<CompletionResult> {
     const modelId = req.model.id;
+    const timeoutMs = override.timeoutMs ?? this.opts.timeoutMs;
+    const maxRetries = override.maxRetries ?? this.opts.maxRetries;
     if (!this.isAvailable(modelId)) throw new CircuitOpenError(modelId);
 
     let attempt = 0;
     for (;;) {
       // Combine the caller's signal (client disconnect / budget stop) with
       // our per-attempt timeout. Whichever fires first aborts the fetch.
-      const timeout = AbortSignal.timeout(this.opts.timeoutMs);
+      const timeout = AbortSignal.timeout(timeoutMs);
       const signal = req.signal ? AbortSignal.any([req.signal, timeout]) : timeout;
       try {
         const result = await provider.complete({ ...req, signal });
@@ -79,7 +90,7 @@ export class ResilientCaller {
       } catch (err) {
         const retryable = err instanceof ProviderError ? err.retryable : false;
         const callerAborted = req.signal?.aborted ?? false;
-        if (!retryable || callerAborted || attempt >= this.opts.maxRetries) {
+        if (!retryable || callerAborted || attempt >= maxRetries) {
           this.recordFailure(modelId, err);
           throw err;
         }

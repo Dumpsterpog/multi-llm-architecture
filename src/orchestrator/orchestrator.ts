@@ -1,15 +1,23 @@
 /**
  * THE ORCHESTRATOR
  *
- * Takes a resolved plan for a request (strategy, models, budget) and runs
- * the matching collaboration strategy. It knows nothing about HTTP, auth,
- * or billing; the gateway pipeline handles those around it. Keeping it
+ * Runs one request in two phases, under ONE per-request budget:
+ *
+ *   1. prepare()  decide what to run. In auto mode this is where the
+ *                 SUPERVISOR model reads the message and dispatch.ts turns
+ *                 its decision into a route/tier/strategy/models. Its tokens
+ *                 go through the same budget and billing as everything else.
+ *   2. strategy   run the chosen collaboration strategy.
+ *
+ * It knows nothing about HTTP, auth, or billing; the gateway pipeline
+ * handles those around it. Keeping it
  * pure like this means it can later run in a background worker fed by a
  * queue (docs section 9, stage 2) without changes.
  */
 import type { ProviderRegistry } from "../providers/registry.js";
 import type { ResilientCaller } from "../providers/resilience.js";
 import { Budget } from "./budget.js";
+import type { Dispatch } from "./dispatch.js";
 import { RecordingCaller } from "./caller.js";
 import { runCritique } from "./strategies/critique.js";
 import { runDebate } from "./strategies/debate.js";
@@ -24,8 +32,16 @@ const STRATEGIES: Record<ConcreteStrategy, (i: StrategyInput, c: RunContext) => 
   critique: runCritique,
 };
 
+/** What prepare() returns: the concrete run, plus the dispatch if the supervisor decided it. */
+export interface PreparedRun {
+  strategy: ConcreteStrategy;
+  input: StrategyInput;
+  dispatch?: Dispatch;
+}
+
 export interface OrchestrationResult extends StrategyOutput {
   strategy: ConcreteStrategy;
+  dispatch?: Dispatch;
   calls: CallRecord[];
   usage: { inputTokens: number; outputTokens: number };
   /** Vendor cost (what we pay). */
@@ -42,8 +58,8 @@ export class Orchestrator {
 
   async run(args: {
     requestId: string;
-    strategy: ConcreteStrategy;
-    input: StrategyInput;
+    /** Decides the run. May call models (the supervisor) through ctx.caller. */
+    prepare: (ctx: RunContext) => Promise<PreparedRun>;
     maxPriceMicros: number;
     markup: number;
     emit?: (e: OrchestrationEvent) => void;
@@ -54,20 +70,21 @@ export class Orchestrator {
     const caller = new RecordingCaller(this.registry, this.resilient, budget, emit, args.signal);
     const ctx: RunContext = { requestId: args.requestId, budget, caller, emit };
 
-    emit({
-      type: "strategy",
-      strategy: args.strategy,
-      models: args.input.ensemble.map((m) => m.id),
-      aggregator: args.input.aggregator.id,
-    });
-
-    // Even if the strategy throws, the caller still needs the call records
+    // Even if anything throws, the caller still needs the call records
     // and spend so it can bill the partial work. Attach them to the error.
     try {
-      const out = await STRATEGIES[args.strategy](args.input, ctx);
+      const run = await args.prepare(ctx);
+      emit({
+        type: "strategy",
+        strategy: run.strategy,
+        models: run.input.ensemble.map((m) => m.id),
+        aggregator: run.input.aggregator.id,
+      });
+      const out = await STRATEGIES[run.strategy](run.input, ctx);
       return {
         ...out,
-        strategy: args.strategy,
+        strategy: run.strategy,
+        dispatch: run.dispatch,
         calls: caller.records,
         usage: { inputTokens: budget.inputTokens, outputTokens: budget.outputTokens },
         costMicros: budget.costMicros,

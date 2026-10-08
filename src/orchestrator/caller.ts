@@ -45,13 +45,17 @@ export class RecordingCaller implements ModelCaller {
     const started = Date.now();
 
     try {
-      const result = await this.resilient.call(provider, {
-        model,
-        messages,
-        maxOutputTokens,
-        temperature: opts.temperature,
-        signal: this.signal,
-      });
+      const result = await this.resilient.call(
+        provider,
+        {
+          model,
+          messages,
+          maxOutputTokens,
+          temperature: opts.temperature,
+          signal: this.signal,
+        },
+        { timeoutMs: opts.timeoutMs, maxRetries: opts.maxRetries },
+      );
       this.budget.end(hold, model, result.usage);
       const cost = costMicros(model, result.usage);
       this.records.push({

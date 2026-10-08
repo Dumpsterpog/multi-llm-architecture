@@ -195,3 +195,32 @@ test("CORS: allowed origin gets headers, preflight succeeds", async () => {
   const other = await server.inject({ method: "OPTIONS", url: "/v1/chat", headers: { origin: "https://evil.example" } });
   assert.equal(other.headers["access-control-allow-origin"], undefined);
 });
+
+test("auto mode: a greeting is answered directly by one model, with the supervisor's reason", async () => {
+  const { server } = setup();
+  const res = await server.inject({ method: "POST", url: "/v1/chat", headers: auth("mlk_team"), payload: { messages: [{ role: "user", content: "hi!" }] } });
+  assert.equal(res.statusCode, 200, res.body);
+  const body = res.json();
+  assert.equal(body.route, "direct");
+  assert.equal(body.tier, null);
+  assert.equal(body.models.length, 1);
+  assert.match(body.supervisor.decided_by, /^mock-/);
+});
+
+test("auto mode: a hard question goes to the plan's top tier (free=lite, team=max)", async () => {
+  const { server } = setup();
+  const hard = "Design a fault tolerant architecture step by step, analyze the trade-offs and edge cases, and prove it handles failover. ".repeat(4);
+  const team = (await server.inject({ method: "POST", url: "/v1/chat", headers: auth("mlk_team"), payload: { messages: [{ role: "user", content: hard }] } })).json();
+  assert.equal(team.route, "max");
+  const free = (await server.inject({ method: "POST", url: "/v1/chat", headers: auth("mlk_free"), payload: { messages: [{ role: "user", content: hard }] } })).json();
+  assert.equal(free.route, "lite");
+  assert.ok(free.models.length <= 2);
+});
+
+test("auto mode streams a supervisor event before the models run", async () => {
+  const { server } = setup();
+  const res = await server.inject({ method: "POST", url: "/v1/chat", headers: auth("mlk_pro"), payload: { messages: [{ role: "user", content: "hello" }], stream: true } });
+  const sup = res.body.indexOf('"type":"supervisor"');
+  const strat = res.body.indexOf('"type":"strategy"');
+  assert.ok(sup > 0 && strat > sup, "supervisor decides first, then the strategy starts");
+});

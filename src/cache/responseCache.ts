@@ -25,6 +25,8 @@ export interface CachedAnswer {
   answer: string;
   strategy: string;
   contributors: string[];
+  /** direct / lite / standard / max / manual, so a cache hit still reports how it was answered. */
+  route?: string;
 }
 
 export class ResponseCache {

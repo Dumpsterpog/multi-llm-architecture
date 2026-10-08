@@ -27,6 +27,7 @@
  * counted in TOKENS and DOLLARS, never in "requests" alone.
  */
 import type { ModelTier } from "./models.js";
+import type { OrchestrationTier } from "./tiers.js";
 
 export type PlanId = "free" | "pro" | "team" | "enterprise";
 
@@ -74,8 +75,14 @@ export interface PlanLimits {
   maxHistoryTokens: number;
 
   // --- Feature access ---
-  /** Strategy used when the client sends "auto" or nothing. Free = 1 model, the cheapest. */
+  /**
+   * Strategy used when the client sends nothing. "auto" = the SUPERVISOR
+   * decides (config/tiers.ts): simple messages go to one model, the rest to
+   * an orchestration tier no higher than `maxOrchestrationTier`.
+   */
   defaultStrategy: Strategy;
+  /** Highest orchestration tier this plan can reach: free = lite, pro = standard, team+ = max. */
+  maxOrchestrationTier: OrchestrationTier;
   allowedStrategies: Strategy[];
   allowedModelTiers: ModelTier[];
   /** Multiplier on our vendor cost. 1.4 = 40% gross margin on tokens. */
@@ -103,7 +110,8 @@ export const PLANS: Record<PlanId, PlanLimits> = {
     maxDebateRounds: 1,
     // Free users get cheap single-model routing and a small 2-model ensemble.
     maxHistoryTokens: 4_000,
-    defaultStrategy: "router",
+    defaultStrategy: "auto",
+    maxOrchestrationTier: "lite",
     allowedStrategies: ["auto", "router", "parallel"],
     allowedModelTiers: ["fast", "balanced"],
     markup: 1.0,
@@ -127,6 +135,7 @@ export const PLANS: Record<PlanId, PlanLimits> = {
     maxDebateRounds: 2,
     maxHistoryTokens: 24_000,
     defaultStrategy: "auto",
+    maxOrchestrationTier: "standard",
     allowedStrategies: ["auto", "router", "parallel", "debate", "critique"],
     allowedModelTiers: ["fast", "balanced", "flagship"],
     markup: 1.3,
@@ -150,6 +159,7 @@ export const PLANS: Record<PlanId, PlanLimits> = {
     maxDebateRounds: 3,
     maxHistoryTokens: 64_000,
     defaultStrategy: "auto",
+    maxOrchestrationTier: "max",
     allowedStrategies: ["auto", "router", "parallel", "debate", "critique"],
     allowedModelTiers: ["fast", "balanced", "flagship"],
     markup: 1.3,
@@ -175,6 +185,7 @@ export const PLANS: Record<PlanId, PlanLimits> = {
     maxDebateRounds: 4,
     maxHistoryTokens: 120_000,
     defaultStrategy: "auto",
+    maxOrchestrationTier: "max",
     allowedStrategies: ["auto", "router", "parallel", "debate", "critique"],
     allowedModelTiers: ["fast", "balanced", "flagship"],
     markup: 1.2,

@@ -91,8 +91,6 @@ test("auto strategy follows complexity and respects the plan", () => {
   assert.equal(selectStrategy("auto", hard, PLANS.pro), "debate");
   // Free plan can't debate, so auto downgrades instead of failing.
   assert.equal(selectStrategy("auto", hard, PLANS.free), "parallel");
-  // Free plan default is the cheapest strategy.
-  assert.equal(selectStrategy(undefined, hard, PLANS.free), "router");
   assert.throws(() => selectStrategy("debate", simple, PLANS.free), AppError);
   assert.equal(heuristicClassify([{ role: "user", content: "fix this bug in my function" }]).category, "coding");
 });

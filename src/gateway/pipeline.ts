@@ -6,23 +6,29 @@
  *  ├─ 3. build the message list (load conversation for website users)
  *  ├─ 4. safety check on the new user message
  *  ├─ 5. trim history to the plan's token allowance          (cost control)
- *  ├─ 6. choose strategy + models allowed by the plan
+ *  ├─ 6. mode: AUTO (supervisor decides) or MANUAL (client named a strategy/models)
  *  ├─ 7. response cache (identical stateless question = free answer)
- *  ├─ 8. token checks: tokens/minute, daily token quota       (cost control)
+ *  ├─ 8. early daily-quota check on the prompt alone          (cost control)
  *  ├─ 9. reserve worst-case spend: customer monthly cap AND
  *  │     platform daily budget                                (cost control)
- *  ├─ 10. ORCHESTRATE: models collaborate under a per-request budget
+ *  ├─ 10. ORCHESTRATOR, under one per-request budget:
+ *  │      a. SUPERVISOR (Gemini) classifies the message       [auto mode]
+ *  │      b. DISPATCH: direct / lite / standard / max, capped by the plan
+ *  │      c. tokens/minute + daily quota for the chosen run    (cost control)
+ *  │      d. run the strategy: models collaborate
  *  ├─ 11. settle: swap reservations for actual usage (always, even on error)
  *  ├─ 12. safety check on the answer
  *  ├─ 13. save conversation + request ledger
  *  └─ 14. respond
  *
  * Order matters: the cheapest checks run first so abusive or over-limit
- * traffic is rejected before we spend anything on it.
+ * traffic is rejected before we spend anything on it. A visual version of
+ * this flow is in docs/REQUEST_FLOW.md.
  */
 import { randomUUID } from "node:crypto";
 import type { Env } from "../config/env.js";
 import { resolveLimits, type PlanLimits } from "../config/plans.js";
+import type { OrchestrationTier, Route } from "../config/tiers.js";
 import { AppError } from "../errors.js";
 import { microsToUsd, usdToMicros } from "../billing/pricing.js";
 import { estimateMessagesTokens } from "../billing/tokenizer.js";
@@ -31,10 +37,12 @@ import type { LimitsService } from "../limits/limits.js";
 import { titleFrom, trimHistory } from "../memory/conversations.js";
 import type { Logger } from "../observability/logger.js";
 import { metrics } from "../observability/metrics.js";
-import type { OrchestrationResult, Orchestrator } from "../orchestrator/orchestrator.js";
+import { buildDispatch, type Dispatch } from "../orchestrator/dispatch.js";
+import type { OrchestrationResult, Orchestrator, PreparedRun } from "../orchestrator/orchestrator.js";
 import { PROMPT_VERSION } from "../orchestrator/prompts.js";
 import { estimateRunTokens, selectModels, selectStrategy } from "../orchestrator/selection.js";
-import type { CallRecord, ConcreteStrategy, OrchestrationEvent } from "../orchestrator/types.js";
+import { chooseSupervisorModel, supervise } from "../orchestrator/supervisor.js";
+import type { CallRecord, ConcreteStrategy, OrchestrationEvent, RunContext } from "../orchestrator/types.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 import type { ResilientCaller } from "../providers/resilience.js";
 import type { ChatMessage } from "../providers/types.js";
@@ -47,9 +55,14 @@ export interface ChatResponse {
   object: "chat.completion";
   conversation_id: string | null;
   answer: string;
+  /** "direct" (one model), an orchestration tier, or "manual" (client chose the strategy). */
+  route: Route | "manual";
+  tier: OrchestrationTier | null;
   strategy: ConcreteStrategy;
   models: string[];
   rounds: number;
+  /** Why the supervisor routed it this way (auto mode only). */
+  supervisor: { decided_by: string; reason: string; category: string; complexity: string } | null;
   usage: { input_tokens: number; output_tokens: number; total_tokens: number; cost_usd: number };
   history_messages_dropped: number;
   cached: boolean;
@@ -82,6 +95,7 @@ export class ChatPipeline {
     const requestId = ctx.requestId ?? randomUUID();
     const started = Date.now();
     const log = this.d.logger.child({ requestId, orgId: principal.orgId });
+    const emit = ctx.emit ?? (() => {});
 
     // 1. Plan limits (with any per-org contract overrides).
     const plan = resolveLimits(principal.plan, principal.limitOverrides);
@@ -102,37 +116,48 @@ export class ChatPipeline {
 
       // 5. Trim history so long chats don't get ever more expensive.
       const { messages, dropped } = trimHistory(fullMessages, plan.maxHistoryTokens, plan.maxInputTokens);
-
-      // 6. Strategy and models.
-      strategy = selectStrategy(body.strategy, messages, plan);
-      const available = this.d.registry.availableModels().filter((m) => this.d.resilient.isAvailable(m.id));
-      const sel = selectModels({ strategy, requested: body.models, requestedAggregator: body.aggregator, plan, available });
       const maxOutputTokens = Math.min(body.max_output_tokens ?? plan.maxOutputTokens, plan.maxOutputTokens);
-      const defaultRounds = strategy === "debate" ? 2 : 1;
-      const rounds = Math.max(1, Math.min(body.rounds ?? defaultRounds, plan.maxDebateRounds));
+      const available = this.d.registry.availableModels().filter((m) => this.d.resilient.isAvailable(m.id));
 
-      // 7. Cache: only for stateless, deterministic questions.
+      // 6. Mode. MANUAL when the client explicitly chose a strategy or models;
+      //    otherwise AUTO: the supervisor decides inside the orchestrator (step 10).
+      const manual = (body.strategy !== undefined && body.strategy !== "auto") || body.models !== undefined;
+      // Manual choices are validated now, before anything is spent (403 if not in the plan).
+      const manualStrategy = manual ? selectStrategy(body.strategy, messages, plan) : undefined;
+      const manualSel = manualStrategy
+        ? selectModels({ strategy: manualStrategy, requested: body.models, requestedAggregator: body.aggregator, plan, available })
+        : undefined;
+      if (manualStrategy) strategy = manualStrategy;
+
+      // 7. Cache: only for stateless, deterministic questions. In auto mode the key
+      //    includes the plan's tier ceiling, so a free user's cached answer is never
+      //    served to a team user (or the other way round).
       const cacheable = !conversationId && messages.filter((m) => m.role !== "system").length === 1 && !body.temperature;
       const cacheKey = cacheable
-        ? this.d.cache.key({ strategy, models: sel.ensemble.map((m) => m.id), messages, maxOutputTokens })
+        ? this.d.cache.key({
+            strategy: manualStrategy ?? `auto/${plan.maxOrchestrationTier}`,
+            models: manualSel?.ensemble.map((m) => m.id) ?? [],
+            messages,
+            maxOutputTokens,
+          })
         : null;
       if (cacheKey) {
         const hit = await this.d.cache.get(cacheKey);
         if (hit) {
           metrics.cacheHits.inc();
           return await this.finish({
-            principal, requestId, started, strategy, conversationId, newUserMessage, dropped, body, cached: true,
-            answer: hit.answer, contributors: hit.contributors, rounds: 0, notes: ["Served from cache."],
+            principal, requestId, started, strategy: hit.strategy as ConcreteStrategy, conversationId, newUserMessage, dropped, body,
+            cached: true, answer: hit.answer, contributors: hit.contributors, rounds: 0, notes: ["Served from cache."],
             calls: [], usage: { inputTokens: 0, outputTokens: 0 }, costMicros: 0, priceMicros: 0,
+            route: (hit.route as Route | "manual" | undefined) ?? (manual ? "manual" : "direct"), dispatch: undefined,
           });
         }
       }
 
-      // 8. Token rate + daily quota, using the worst-case estimate for this run.
-      const n = strategy === "router" ? 1 : sel.ensemble.length;
-      const estimatedTokens = estimateRunTokens(strategy, estimateMessagesTokens(messages), maxOutputTokens, n, rounds);
-      await this.guard("tpm", () => this.d.limits.checkTokenRate(principal.orgId, plan, estimatedTokens));
-      await this.guard("daily_tokens", () => this.d.limits.checkDailyTokens(principal.orgId, plan, estimatedTokens));
+      // 8. Early, free check: if even the prompt alone breaks the daily quota, stop
+      //    before paying for a supervisor call.
+      const promptTokens = estimateMessagesTokens(messages);
+      await this.guard("daily_tokens", () => this.d.limits.checkDailyTokens(principal.orgId, plan, promptTokens));
 
       // 9. Reserve worst-case spend for the customer AND for the platform.
       const maxPriceMicros = Math.min(usdToMicros(plan.maxRequestCostUsd), usdToMicros(body.max_cost_usd ?? Infinity));
@@ -143,27 +168,70 @@ export class ChatPipeline {
           this.d.limits.reservePlatformBudget(Math.ceil(maxPriceMicros / plan.markup), this.d.env.PLATFORM_DAILY_BUDGET_USD),
         );
       } catch (err) {
-        await this.d.limits.settle({ orgId: principal.orgId, plan, reservation, actualPriceMicros: 0, estimatedTokens, actualTokens: 0 });
+        await this.d.limits.settle({ orgId: principal.orgId, plan, reservation, actualPriceMicros: 0, estimatedTokens: 0, actualTokens: 0 });
         throw err;
       }
 
-      // 10 + 11. Orchestrate, then ALWAYS settle with whatever was actually spent.
+      // 10. Orchestrate. prepare() decides WHAT to run (supervisor + dispatch in auto
+      //     mode) and checks token limits for that run; then the strategy runs.
+      let estimatedTokens = 0;
+      const prepare = async (run: RunContext): Promise<PreparedRun> => {
+        let prepared: PreparedRun;
+        if (manualStrategy && manualSel) {
+          const rounds = Math.max(1, Math.min(body.rounds ?? (manualStrategy === "debate" ? 2 : 1), plan.maxDebateRounds));
+          prepared = {
+            strategy: manualStrategy,
+            input: { messages, ensemble: manualSel.ensemble, aggregator: manualSel.aggregator, classifier: manualSel.classifier, rounds, maxOutputTokens, temperature: body.temperature },
+          };
+        } else {
+          // 10a. Supervisor reads the message.
+          const supervisorModel = chooseSupervisorModel(available);
+          const decision = await supervise(run, messages, supervisorModel);
+          // 10b. Dispatch: plain code turns the decision into a plan-safe run.
+          const dispatch = buildDispatch(decision, plan, available);
+          run.emit({
+            type: "supervisor",
+            route: dispatch.route,
+            category: decision.category,
+            complexity: decision.complexity,
+            reason: decision.reason,
+            decidedBy: decision.decidedBy,
+          });
+          prepared = {
+            strategy: dispatch.strategy,
+            dispatch,
+            input: {
+              messages,
+              ensemble: dispatch.ensemble,
+              aggregator: dispatch.aggregator,
+              classifier: supervisorModel ?? dispatch.aggregator,
+              rounds: dispatch.rounds,
+              maxOutputTokens,
+              temperature: body.temperature,
+              // Direct route: the supervisor already classified it, so the router doesn't pay again.
+              classification: dispatch.route === "direct" ? { category: decision.category, complexity: "simple" } : undefined,
+            },
+          };
+        }
+        strategy = prepared.strategy;
+
+        // 10c. Token rate + daily quota for THIS run's worst case.
+        const n = prepared.strategy === "router" ? 1 : prepared.input.ensemble.length;
+        estimatedTokens = estimateRunTokens(prepared.strategy, promptTokens, maxOutputTokens, n, prepared.input.rounds);
+        await this.guard("tpm", () => this.d.limits.checkTokenRate(principal.orgId, plan, estimatedTokens));
+        await this.guard("daily_tokens", () => this.d.limits.checkDailyTokens(principal.orgId, plan, estimatedTokens));
+        return prepared;
+      };
+
+      // 11. Run, then ALWAYS settle with whatever was actually spent.
       let result: OrchestrationResult | undefined;
       let spent: Partial_ = { calls: [], usage: { inputTokens: 0, outputTokens: 0 }, costMicros: 0, priceMicros: 0 };
       try {
-        result = await this.d.orchestrator.run({
-          requestId,
-          strategy,
-          input: { messages, ensemble: sel.ensemble, aggregator: sel.aggregator, classifier: sel.classifier, rounds, maxOutputTokens, temperature: body.temperature },
-          maxPriceMicros,
-          markup: plan.markup,
-          emit: ctx.emit,
-          signal: ctx.signal,
-        });
+        result = await this.d.orchestrator.run({ requestId, prepare, maxPriceMicros, markup: plan.markup, emit, signal: ctx.signal });
         spent = result;
       } catch (err) {
         spent = ((err as { partial?: Partial_ }).partial ?? spent);
-        // Bill partial work, then record the failure.
+        // Bill partial work (e.g. the supervisor call), then record the failure.
         await this.settleAll(principal.orgId, plan, reservation, platformRes, spent, estimatedTokens);
         await this.record(principal, requestId, started, strategy, conversationId, spent, false, err);
         throw err;
@@ -172,12 +240,14 @@ export class ChatPipeline {
 
       // 12. Safety on the final answer.
       const answer = await this.d.safety.checkOutput(result.answer);
-      if (cacheKey) await this.d.cache.set(cacheKey, { answer, strategy, contributors: result.contributors });
+      const route: Route | "manual" = result.dispatch?.route ?? "manual";
+      if (cacheKey) await this.d.cache.set(cacheKey, { answer, strategy: result.strategy, contributors: result.contributors, route });
 
       return await this.finish({
-        principal, requestId, started, strategy, conversationId, newUserMessage, dropped, body, cached: false,
+        principal, requestId, started, strategy: result.strategy, conversationId, newUserMessage, dropped, body, cached: false,
         answer, contributors: result.contributors, rounds: result.roundsCompleted, notes: result.notes,
         calls: result.calls, usage: result.usage, costMicros: result.costMicros, priceMicros: result.priceMicros,
+        route, dispatch: result.dispatch,
       });
     } catch (err) {
       metrics.requests.inc({ strategy, outcome: err instanceof AppError ? err.type : "internal_error" });
@@ -284,6 +354,8 @@ export class ChatPipeline {
     usage: { inputTokens: number; outputTokens: number };
     costMicros: number;
     priceMicros: number;
+    route: Route | "manual";
+    dispatch: Dispatch | undefined;
   }): Promise<ChatResponse> {
     // 13. Save the chat (website mode only). A new chat is created on its first successful answer.
     let conversationId = a.conversationId;
@@ -309,9 +381,19 @@ export class ChatPipeline {
       object: "chat.completion",
       conversation_id: conversationId,
       answer: a.answer,
+      route: a.route,
+      tier: a.dispatch?.tier ?? null,
       strategy: a.strategy,
       models: a.contributors,
       rounds: a.rounds,
+      supervisor: a.dispatch
+        ? {
+            decided_by: a.dispatch.decision.decidedBy,
+            reason: a.dispatch.decision.reason,
+            category: a.dispatch.decision.category,
+            complexity: a.dispatch.decision.complexity,
+          }
+        : null,
       usage: {
         input_tokens: a.usage.inputTokens,
         output_tokens: a.usage.outputTokens,

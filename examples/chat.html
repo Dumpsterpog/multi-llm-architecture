@@ -39,8 +39,7 @@
   <div class="bar">
     Strategy
     <select id="strategy">
-      <option value="">plan default</option>
-      <option value="auto">auto</option>
+      <option value="">auto (supervisor decides)</option>
       <option value="router">router (1 model, cheapest)</option>
       <option value="parallel">parallel + synthesis</option>
       <option value="debate">debate</option>
@@ -181,7 +180,9 @@ async function send(text) {
           bubble.textContent = payload.answer;
           const meta = document.createElement("div");
           meta.className = "meta";
-          meta.textContent = `${payload.strategy} via ${payload.models.join(", ")}  |  ${payload.usage.total_tokens} tokens, $${payload.usage.cost_usd.toFixed(5)}`;
+          const how = payload.route === "manual" ? payload.strategy : payload.route === "direct" ? "direct" : `${payload.route} tier, ${payload.strategy}`;
+          const why = payload.supervisor ? `  |  supervisor (${payload.supervisor.decided_by}): ${payload.supervisor.reason}` : "";
+          meta.textContent = `${how} via ${payload.models.join(", ")}  |  ${payload.usage.total_tokens} tokens, $${payload.usage.cost_usd.toFixed(5)}${why}`;
           bubble.appendChild(meta);
         }
       }
@@ -197,8 +198,11 @@ async function send(text) {
 
 function describe(e) {
   switch (e.type) {
+    case "supervisor": return e.route === "direct"
+      ? `Supervisor: simple message, one model will answer (${e.reason})`
+      : `Supervisor: ${e.complexity} ${e.category} task, ${e.route} orchestration (${e.reason})`;
     case "strategy": return `Using ${e.strategy} with ${e.models.length} model(s)...`;
-    case "model_start": return `${e.modelId} is ${e.stage === "answer" ? "thinking" : e.stage + "ing"}...`;
+    case "model_start": return e.stage === "supervise" ? "Supervisor is reading your message..." : `${e.modelId} is ${e.stage === "answer" ? "thinking" : e.stage + "ing"}...`;
     case "model_done": return `${e.modelId} ${e.ok ? "done" : "failed"} (${e.stage})`;
     case "stage": return e.stage === "synthesize" ? "Combining answers..." : `Stage: ${e.stage}, round ${e.round}`;
     case "consensus": return `Models agreed after round ${e.round}`;
