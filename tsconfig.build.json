@@ -1,0 +1,11 @@
+{
+  // Production build: compiles only src/ into dist/ (tests and scripts are not shipped).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts"]
+}
