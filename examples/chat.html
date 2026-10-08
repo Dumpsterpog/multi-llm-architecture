@@ -29,6 +29,8 @@
   button { padding:0 16px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
   button.secondary { background:transparent; color:var(--text); border-color:var(--border); }
   select { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; }
+  .notice { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:10px 12px; margin-bottom:8px; font-size:14px; }
+  .notice[hidden] { display:none; }
   .bar { display:flex; gap:8px; align-items:center; margin-bottom:8px; color:var(--muted); font-size:13px; }
 </style>
 </head>
@@ -47,6 +49,7 @@
     <button class="secondary" id="newChat" type="button">New chat</button>
     <span id="usage"></span>
   </div>
+  <div id="notice" class="notice" hidden></div>
   <div id="log"></div>
   <form id="form">
     <textarea id="input" placeholder="Ask anything..."></textarea>
@@ -55,26 +58,66 @@
   </form>
 </main>
 <script>
-const API = location.origin; // same origin in dev; your API domain in prod
+// Same origin when served by the gateway at /demo; on your real site, your API's URL.
+// Opened straight from disk (file://) there is no server address, so nothing can work.
+const OPENED_AS_FILE = location.protocol === "file:";
+const API = OPENED_AS_FILE ? null : location.origin;
 let token = null;
 let conversationId = null;
 let controller = null;
 
 const $ = (id) => document.getElementById(id);
 
+/** Show a setup problem above the chat, in words a person can act on. */
+function showNotice(text) {
+  $("notice").textContent = text;
+  $("notice").hidden = !text;
+}
+
+const SERVER_DOWN = () =>
+  `Can't reach the server at ${API}. Start it with "npm run dev" in the project folder, then refresh this page.`;
+
 async function login() {
+  if (OPENED_AS_FILE) {
+    showNotice(
+      "This page was opened as a file, so it has no server to talk to. " +
+      'Run "npm run dev" in the project folder, then open http://localhost:8080/demo in your browser.',
+    );
+    return;
+  }
   // Real site: token = await firebaseAuth.currentUser.getIdToken()  (Firebase client SDK, after Google sign-in)
-  const r = await fetch(`${API}/v1/auth/dev-token`, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ user_id: "demo-user" }),
-  });
+  let r;
+  try {
+    r = await fetch(`${API}/v1/auth/dev-token`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ user_id: "demo-user" }),
+    });
+  } catch {
+    showNotice(SERVER_DOWN());
+    return;
+  }
+  if (!r.ok) {
+    showNotice(
+      r.status === 404
+        ? "Demo login is off. Set AUTH_JWT_SECRET in .env (and NODE_ENV is not production), then restart the server."
+        : `Demo login failed (HTTP ${r.status}).`,
+    );
+    return;
+  }
   token = (await r.json()).token;
+  showNotice("");
   refreshUsage();
 }
 
 async function refreshUsage() {
-  const r = await fetch(`${API}/v1/me`, { headers: { authorization: `Bearer ${token}` } });
-  const me = await r.json();
-  $("usage").textContent = `${me.plan.name} plan, ${me.usage.daily_tokens_remaining.toLocaleString()} tokens left today`;
+  if (!token) return;
+  try {
+    const r = await fetch(`${API}/v1/me`, { headers: { authorization: `Bearer ${token}` } });
+    const me = await r.json();
+    if (!r.ok) return showNotice(me.error?.message ?? `Could not load your plan (HTTP ${r.status}).`);
+    $("usage").textContent = `${me.plan.name} plan, ${me.usage.daily_tokens_remaining.toLocaleString()} tokens left today`;
+  } catch {
+    showNotice(SERVER_DOWN());
+  }
 }
 
 function addMsg(text, cls) {
@@ -89,6 +132,14 @@ function addMsg(text, cls) {
 async function send(text) {
   addMsg(text, "user");
   const bubble = addMsg("", "assistant");
+  if (!token) {
+    // Not logged in: the notice above says why. Try again in case the server is up now.
+    await login();
+    if (!token) {
+      bubble.textContent = $("notice").textContent || "Not connected to the server.";
+      return;
+    }
+  }
   const progress = document.createElement("div");
   progress.className = "progress";
   bubble.appendChild(progress);
@@ -137,7 +188,7 @@ async function send(text) {
     }
   } catch (e) {
     if (e.name === "AbortError") bubble.textContent = "Stopped.";
-    else bubble.textContent = "Network error.";
+    else bubble.textContent = API ? SERVER_DOWN() : "No server to talk to. See the note above.";
   } finally {
     $("send").hidden = false; $("stop").hidden = true;
     refreshUsage();
