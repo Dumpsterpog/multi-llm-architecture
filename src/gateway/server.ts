@@ -15,7 +15,7 @@
  *
  * Endpoints:
  *   GET    /health                     liveness (process is up)
- *   GET    /ready                      readiness (Redis + Postgres reachable)
+ *   GET    /ready                      readiness (counters + Firestore reachable)
  *   GET    /metrics                    Prometheus (keep internal, see below)
  *   GET    /v1/models                  models the caller's plan can use
  *   GET    /v1/me                      plan, limits and current usage
@@ -40,7 +40,7 @@ import { registry as metricsRegistry } from "../observability/metrics.js";
 import type { OrchestrationEvent } from "../orchestrator/types.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 import type { Principal, Store } from "../store/types.js";
-import { authenticate, signJwt } from "./auth.js";
+import { authenticate, signJwt, type WebTokenVerifier } from "./auth.js";
 import type { ChatPipeline } from "./pipeline.js";
 import { ChatBody, DevTokenBody, ListConversationsQuery } from "./schemas.js";
 
@@ -52,6 +52,7 @@ export interface ServerDeps {
   limits: LimitsService;
   registry: ProviderRegistry;
   pipeline: ChatPipeline;
+  verifyWebToken: WebTokenVerifier;
 }
 
 declare module "fastify" {
@@ -104,7 +105,7 @@ export function buildServer(d: ServerDeps) {
   // --- Auth for everything under /v1 except the dev-token route ---
   app.addHook("preHandler", async (req) => {
     if (!req.url.startsWith("/v1/") || req.url.startsWith("/v1/auth/")) return;
-    req.principal = await authenticate(req.headers.authorization, d.store, d.env.AUTH_JWT_SECRET);
+    req.principal = await authenticate(req.headers.authorization, d.store, d.verifyWebToken);
   });
 
   // --- One error format for everything ---

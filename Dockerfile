@@ -1,5 +1,9 @@
+# OPTIONAL. You do not need Docker to run or deploy this service.
+# Render / Railway run it straight from GitHub (build: npm ci && npm run build,
+# start: npm start). This file is only used if you deploy to a container host
+# such as Google Cloud Run, which can also build without it.
+#
 # Multi-stage build: compile TypeScript in one image, ship only the output.
-# Small final image = faster deploys, smaller attack surface.
 
 FROM node:22-alpine AS build
 WORKDIR /app

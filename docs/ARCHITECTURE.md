@@ -67,8 +67,9 @@ flowchart LR
   end
 
   subgraph Data
-    R[(Redis<br/>counters, cache)]
-    PG[(Postgres<br/>users, chats, ledger)]
+    R[(Counters + cache<br/>Firestore now, Redis later)]
+    PG[(Firestore<br/>users, chats, ledger)]
+    FA[Firebase Auth<br/>logins]
   end
 
   subgraph Vendors
@@ -86,13 +87,14 @@ flowchart LR
   LIM <--> R
   ORCH <--> R
   AUTH <--> PG
+  AUTH -. verify ID token .-> FA
   ORCH --> PG
   API -.-> OBS
 ```
 
 Two design rules shape everything:
 
-1. **API servers are stateless.** Every piece of shared state (rate-limit counters, quotas, cache) lives in Redis, and everything durable (users, chats, billing) lives in Postgres. Any server can handle any request, so scaling means "run more copies".
+1. **API servers are stateless.** Every piece of shared state (rate-limit counters, quotas, cache) lives in a shared counter store (Firestore at launch, Redis when traffic grows), and everything durable (users, chats, billing) lives in Firestore. Any server can handle any request, so scaling means "run more copies".
 2. **Layers only talk through interfaces.** The orchestrator does not know which vendor it is calling, and the gateway does not know how a debate works. That is why each part can be replaced or scaled on its own.
 
 ### Code map
@@ -108,7 +110,7 @@ Two design rules shape everything:
 | Memory | `src/memory/` | Conversation history trimming |
 | Safety | `src/safety/` | Moderation, prompt-injection signals |
 | Cache | `src/cache/` | Response cache |
-| Storage | `src/store/`, `src/kv/` | Postgres and Redis behind interfaces, with in-memory versions for dev |
+| Storage | `src/store/`, `src/kv/`, `src/firebase.ts` | Firestore (data + counters) and optional Redis behind interfaces, with in-memory versions for dev |
 | Observability | `src/observability/` | Structured logs, Prometheus metrics |
 
 ---
@@ -122,13 +124,13 @@ sequenceDiagram
   autonumber
   participant U as Browser
   participant G as Gateway
-  participant R as Redis
-  participant P as Postgres
+  participant R as Counters (Firestore/Redis)
+  participant P as Firestore
   participant O as Orchestrator
   participant M as Models (Claude, GPT, Gemini)
 
   U->>G: POST /v1/chat {message, conversation_id, stream:true}
-  G->>G: verify login token
+  G->>G: verify Firebase ID token
   G->>R: IP rate, requests/min, concurrency slot
   G->>P: load conversation history
   G->>G: moderation, trim history to plan allowance
@@ -150,7 +152,7 @@ sequenceDiagram
   G-->>U: event: done {answer, usage, cost}
 ```
 
-**Why this order:** the cheapest checks run first. A flood of requests is rejected by a Redis counter that costs a fraction of a millisecond, long before anything calls a paid model.
+**Why this order:** the cheapest checks run first. A flood of requests is rejected by a single counter check, long before anything calls a paid model.
 
 **Stop button:** if the browser disconnects (tab closed, Stop pressed), the server aborts every in-flight model call through an `AbortSignal`. You only pay for tokens already generated.
 
@@ -162,7 +164,7 @@ sequenceDiagram
 
 - `server.ts`: routes, CORS, security headers, one JSON error format, SSE streaming, heartbeat, client-disconnect abort.
 - `auth.ts`: two ways to log in, both sent as `Authorization: Bearer ...`
-  - **Website users** send their auth provider's JWT (Supabase, Firebase, Clerk, Auth0). The first login creates the user and a personal organisation on the free plan.
+  - **Website users** sign in with Firebase Auth in the browser and send `await auth.currentUser.getIdToken()`. The server verifies it with the Firebase Admin SDK (`verifyIdToken`, the same call the FORKSAI API uses). The first login creates the user and a personal organisation on the free plan.
   - **Developers** send an API key `mlk_...`. Only its SHA-256 hash is stored, so a database leak does not leak usable keys.
 - `pipeline.ts`: the 14-step request flow from section 3.
 - `schemas.ts`: zod validation. Every field from the internet is type-checked and size-bounded before use.
@@ -284,8 +286,8 @@ One user message fans out into many model calls. A 3-model, 2-round debate is 3 
 
 | Kind | Examples | Protects | Enforced by |
 |---|---|---|---|
-| **Rate limits** (per minute) | requests/min, tokens/min, concurrent requests, requests/min per IP | The platform from bursts | Token buckets in Redis |
-| **Quotas** (per day / month) | daily tokens, monthly included $, monthly hard cap $ | The business from unprofitable customers | Counters + reservations in Redis, ledger in Postgres |
+| **Rate limits** (per minute) | requests/min, tokens/min, concurrent requests, requests/min per IP | The platform from bursts | Token buckets in the counter store |
+| **Quotas** (per day / month) | daily tokens, monthly included $, monthly hard cap $ | The business from unprofitable customers | Counters + reservations in the counter store, ledger in Firestore |
 | **Per-request caps** | max input, max output, max models, max rounds, max $ per request | Against one runaway request | The orchestrator's `Budget` |
 
 ### 6.4 Default plans
@@ -312,14 +314,14 @@ These numbers are a starting point. Tune them against your real costs from the `
 
 ### 6.5 How each limit is enforced
 
-**Token bucket (rate limits).** A bucket holds up to *capacity* tokens and refills at a steady rate. Each request removes some; if there are not enough, it gets `429` with `Retry-After`. This allows short bursts while enforcing an average, the same way vendor limits behave. It runs as one atomic Lua script in Redis so 50 API servers share one correct counter (`src/kv/redis.ts`).
+**Token bucket (rate limits).** A bucket holds up to *capacity* tokens and refills at a steady rate. Each request removes some; if there are not enough, it gets `429` with `Retry-After`. This allows short bursts while enforcing an average, the same way vendor limits behave. It runs atomically (a Firestore transaction in `src/kv/firestore.ts`, or a Lua script in `src/kv/redis.ts`) so any number of API servers share one correct counter.
 
 **Reservation, then settle (quotas and budgets).** This works like a card payment hold:
 
 ```mermaid
 sequenceDiagram
   participant P as Pipeline
-  participant R as Redis
+  participant R as Counter store
   P->>R: reserve worst case ($0.75): spent + held + 0.75 <= cap ?
   R-->>P: ok (held += 0.75)
   Note over P: models run, actual cost = $0.12
@@ -369,34 +371,45 @@ The same question with **router** (Sonnet alone, plus a tiny classifier call) co
 
 - **Money is integer micro-dollars** (1 USD = 1,000,000) everywhere. Floating-point dollars drift (`0.1 + 0.2 !== 0.3`) and that error accumulates over millions of calls.
 - **Two amounts per request:** `cost` (what vendors charge us) and `price` (cost x plan markup, what the customer pays). Both are stored, so margin is always visible.
-- **The ledger is append-only** (`usage_ledger`). Rows are never updated or deleted; corrections are new `adjustment` rows. `UNIQUE(request_id, kind)` makes writes idempotent, so a retried write cannot double-bill.
-- **Redis is the fast mirror, Postgres is the truth.** Limits read Redis counters in under a millisecond. A nightly reconciler job (roadmap) recomputes the counters from the ledger and alerts on drift.
+- **The ledger is append-only** (`llm_ledger`). Documents are never updated or deleted; corrections are new `adjustment` documents. The document id is `<requestId>_<kind>`, which makes writes idempotent: a retried write overwrites itself instead of double-billing.
+- **Counters are the fast mirror, the ledger is the truth.** Limits read small counter documents. A nightly reconciler job (roadmap) recomputes the counters from the ledger and alerts on drift.
 - **Failed requests still bill partial work.** If 2 of 3 models answered before an error, those tokens were paid to vendors, so they are recorded.
-- **Subscriptions:** your payment provider's webhook (Stripe, DodoPayments, Razorpay) writes `subscriptions` and updates `organizations.plan`. The gateway reads the plan on each request, so an upgrade takes effect immediately.
+- **Subscriptions:** your payment provider's webhook (Stripe, DodoPayments, Razorpay) updates the `plan` field on `llm_orgs/{orgId}`. The gateway caches a user's plan for 30 seconds, so an upgrade takes effect within half a minute.
 
 ---
 
 ## 8. Data model
 
-Full schema with comments: `db/schema.sql`.
+Firestore collections (details and field lists in `src/store/firestore.ts`). Every name starts with `llm_` (`FIRESTORE_COLLECTION_PREFIX`) so the service can share a Firebase project with another app, such as FORKSAI, which already has its own `users` collection.
+
+| Collection | Doc id | Holds |
+|---|---|---|
+| `llm_orgs` | org id (a website user's = their Firebase uid) | `plan`, `limitOverrides`, name. The billing unit |
+| `llm_users` | Firebase uid | `orgId`, email |
+| `llm_apiKeys` | SHA-256 of the key | `orgId`, name, `revokedAt`. The raw key is never stored |
+| `llm_conversations` | auto id | `userId`, `orgId`, title, `updatedAt`, `deleted` |
+| `llm_conversations/{id}/messages` | auto id | `role`, `content`, `seq` (order) |
+| `llm_requests` | request id | tokens, cost, price, strategy, status, and a `calls` array with per-model stats |
+| `llm_ledger` | `<requestId>_usage` | append-only billing rows |
+| `llm_kv` | counter key | rate-limit and quota counters, with `expiresAt` for TTL cleanup |
 
 ```mermaid
 erDiagram
-  organizations ||--o{ users : has
-  organizations ||--o{ api_keys : has
-  organizations ||--o| subscriptions : pays
-  organizations ||--o{ conversations : owns
-  users ||--o{ conversations : writes
-  conversations ||--o{ messages : contains
-  organizations ||--o{ requests : makes
-  requests ||--o{ model_calls : "fans out to"
-  requests ||--o| usage_ledger : "billed as"
+  llm_orgs ||--o{ llm_users : has
+  llm_orgs ||--o{ llm_apiKeys : has
+  llm_orgs ||--o{ llm_conversations : owns
+  llm_users ||--o{ llm_conversations : writes
+  llm_conversations ||--o{ messages : contains
+  llm_orgs ||--o{ llm_requests : makes
+  llm_requests ||--o| llm_ledger : "billed as"
 ```
 
 - **Organisation** is the billing unit. A website user gets a personal org automatically; a company shares one.
-- **Conversation ownership** is checked inside every SQL `WHERE` clause, so a guessed id returns nothing.
-- **Model outputs are not stored per call** (`model_calls` holds counts and timings only). Only the final messages the user saw are kept. Less stored data means less to leak.
-- At scale, partition `requests` and `model_calls` by month.
+- **Conversation ownership** is checked on every read: the server loads the document and compares its `userId`/`orgId` with the caller before returning anything, so a guessed id returns 404.
+- **Browsers never touch these collections.** Only the server reads and writes them through the Admin SDK; `firestore.rules` explains how to keep client access closed.
+- **Model outputs are not stored per call** (the `calls` array holds counts and timings only). Only the final messages the user saw are kept. Less stored data means less to leak.
+- **Indexes** for the sidebar and usage queries are in `firestore.indexes.json` (deploy with `firebase deploy --only firestore:indexes`).
+- **Firestore costs** are per document read/write: about 4 writes and a few reads per chat message, a fraction of a cent and tiny next to model costs.
 
 ---
 
@@ -406,7 +419,22 @@ The code is written so each stage is a deployment change, not a rewrite.
 
 ### Stage 1: launch (up to roughly 10k daily users)
 
-One region. 2 or more API containers behind a load balancer (Fly.io, Railway, Render, Cloud Run, ECS). Managed Postgres and managed Redis. This repo as-is.
+One region. Firestore for everything (data and counters). The API runs on any Node host; see [section 9.1](#91-where-to-deploy-no-docker-needed). This repo as-is.
+
+**When to add Redis:** Firestore handles about one sustained write per second on any single document. Per-user counters never get near that, but the platform-wide daily budget is one shared document written on every request. Past roughly one chat request per second across the whole site (around 80,000 a day), create a serverless Redis at Upstash and set `KV=redis` and `REDIS_URL`. No code changes; Firestore stays the database.
+
+
+### 9.1 Where to deploy (no Docker needed)
+
+Docker is **optional**. The service is a normal Node app: `npm ci && npm run build`, then `npm start`.
+
+| Host | Docker? | Notes |
+|---|---|---|
+| **Google Cloud Run** (recommended with Firebase) | No: `gcloud run deploy --source .` builds it for you | Same Google project as Firebase, so no private key is needed (it uses the service's own account). Scales to zero when idle; set request timeout to 300s for long debates. |
+| **Render / Railway** | No: connect the GitHub repo | Simplest dashboards. Put the Firebase variables in their env settings. |
+| **Vercel** (where FORKSAI runs) | No | Not a good fit for this service as written: it is a long-running server, and serverless functions have time limits (60s in the FORKSAI config) that long debates with streaming can exceed. Keep FORKSAI on Vercel and run this API separately. |
+
+The `Dockerfile` stays in the repo only for hosts that want a container image.
 
 ### Stage 2: growth
 
@@ -417,26 +445,26 @@ flowchart LR
   Q --> WK[Orchestrator workers<br/>autoscaled on queue depth]
   WK -- progress events --> PS[(Redis pub/sub)] --> GW
   WK --> V[Vendors]
-  PG[(Postgres primary)] --> RR[(Read replicas)]
+  FS[(Firestore<br/>scales automatically)]
 ```
 
 - **Split gateway and workers.** Long debates no longer hold web-server connections; workers scale on queue depth. The orchestrator already has no HTTP dependencies, which makes this split possible.
 - **Kubernetes** with a HorizontalPodAutoscaler. Scale on in-flight requests, not CPU, because these servers mostly wait on vendors.
-- **PgBouncer** for connection pooling, plus read replicas for history and analytics reads.
-- **Redis Cluster** once one node is not enough. Keys already include the org id, which shards naturally.
+- **Firestore** scales reads and writes automatically; nothing to tune except keeping hot single documents rare (the counters move to Redis at this stage).
+- **Redis Cluster** once one Redis node is not enough. Keys already include the org id, which shards naturally.
 - **Multiple API keys per vendor** (or an enterprise tier) to raise vendor rate limits, rotated by the adapter.
 - **Batch APIs** for non-urgent work (evals, summaries) at about half price.
 
 ### Stage 3: large scale
 
 - Multi-region active-active, with users pinned to a home region for data residency (EU users' data stays in the EU).
-- Analytics moved out of Postgres into a warehouse (BigQuery, ClickHouse) through change data capture.
+- Analytics moved into BigQuery with Firebase's "Stream Firestore to BigQuery" extension, so heavy reports don't run against Firestore.
 - A learned router (section 13) and self-hosted open models for cheap traffic.
 - Vendor prompt caching for long shared system prompts and documents.
 
 ### Capacity rule of thumb
 
-Each request mostly waits on vendors (I/O), so one Node process handles hundreds of concurrent requests. The real ceilings, in order, are usually: **vendor rate limits**, then **your budget**, then **Postgres connections**, and only last CPU.
+Each request mostly waits on vendors (I/O), so one Node process handles hundreds of concurrent requests. The real ceilings, in order, are usually: **vendor rate limits**, then **your budget**, then **hot Firestore documents** (fixed by moving counters to Redis), and only last CPU.
 
 ---
 
@@ -452,7 +480,7 @@ Each request mostly waits on vendors (I/O), so one Node process handles hundreds
 | Budget reached mid-run | Stop calling models; return best answer so far, with a note |
 | Server crash mid-request | Concurrency slots have a TTL so they free themselves; reservations are recomputed by the reconciler |
 | Deploy | Graceful shutdown drains in-flight requests (up to 90s) before exit |
-| Redis down | `/ready` fails, load balancer stops routing; requests fail closed (no unmetered spending) |
+| Counter store (Firestore/Redis) down | `/ready` fails, load balancer stops routing; requests fail closed (no unmetered spending) |
 
 **Targets to aim for:** 99.9% availability for `/v1/chat`; time to first progress event under 1s at p95; partial-answer rate (some model failed) under 2%.
 
@@ -466,7 +494,7 @@ Each request mostly waits on vendors (I/O), so one Node process handles hundreds
 - JWT verification rejects `alg: none` and algorithm confusion, compares signatures in constant time, and checks expiry.
 - API keys are 256-bit random, shown once, stored hashed, revocable.
 - CORS allows only your website's origins.
-- Every conversation query filters by owner in SQL.
+- Every conversation read checks the owner before returning data, and Firestore rules keep browsers out of the `llm_` collections entirely.
 
 **Secrets**
 
@@ -533,7 +561,7 @@ A multi-model system is only worth its extra cost if it measurably beats a singl
 
 - Token-by-token streaming of the final synthesis step (each adapter parses its vendor's stream; the pipeline forwards `delta` events).
 - Conversation summarisation instead of hard history trimming.
-- Postgres reconciler job (Redis counters vs ledger) and retention hard-delete job.
+- Reconciler job (counters vs ledger) and retention hard-delete job (a scheduled Cloud Function works well with Firestore).
 - Payment webhook to update plans; usage-based invoicing for overage.
 - Signup abuse controls: CAPTCHA, email verification, disposable-email blocking.
 

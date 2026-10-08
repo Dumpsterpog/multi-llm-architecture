@@ -4,7 +4,7 @@
   Served by the gateway at http://localhost:8080/demo in development.
 
   Shows the 4 things your real frontend (React/Next.js) needs to do:
-    1. get a login token        (here: dev token; in prod: your auth provider)
+    1. get a login token        (here: dev token; on your site: Firebase getIdToken())
     2. POST /v1/chat with stream:true and read Server-Sent Events via fetch()
     3. keep conversation_id so follow-ups continue the same chat
     4. a Stop button that aborts the fetch (the server then cancels model calls = no wasted cost)
@@ -63,7 +63,7 @@ let controller = null;
 const $ = (id) => document.getElementById(id);
 
 async function login() {
-  // Replace with your auth provider: e.g. (await supabase.auth.getSession()).data.session.access_token
+  // Real site: token = await firebaseAuth.currentUser.getIdToken()  (Firebase client SDK, after Google sign-in)
   const r = await fetch(`${API}/v1/auth/dev-token`, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ user_id: "demo-user" }),
   });

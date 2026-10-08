@@ -1,9 +1,9 @@
 /**
- * PERSISTENT STORE INTERFACE (Postgres in production, memory in dev)
+ * PERSISTENT STORE INTERFACE (Firestore in production, memory in dev)
  *
  * Everything that must survive restarts lives behind this interface:
  * users, API keys, conversations (for the chat website), and the request
- * ledger (for billing and analytics). See db/schema.sql for the tables.
+ * ledger (for billing and analytics). See store/firestore.ts for the collections.
  */
 import type { PlanId, PlanLimits } from "../config/plans.js";
 import type { CallRecord } from "../orchestrator/types.js";

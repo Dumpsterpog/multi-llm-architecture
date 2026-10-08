@@ -14,7 +14,8 @@ export const ChatBody = z
   .object({
     // --- Website mode: send just the new message (+ conversation_id to continue a chat).
     message: z.string().min(1).max(400_000).optional(),
-    conversation_id: z.string().uuid().optional(),
+    // Firestore auto-ids (20 chars) or UUIDs; restricted charset so it's safe as a document id.
+    conversation_id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, "invalid conversation id").optional(),
 
     // --- API mode: send the full message list yourself (stateless, like the vendor APIs).
     messages: z.array(Message).min(1).max(500).optional(),

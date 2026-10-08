@@ -21,11 +21,26 @@ const EnvSchema = z.object({
   PORT: z.coerce.number().int().positive().default(8080),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
 
-  // Storage backends. "memory" = zero-infra dev mode.
-  STORE: z.enum(["memory", "postgres"]).default("memory"),
-  DATABASE_URL: z.string().optional(),
-  KV: z.enum(["memory", "redis"]).default("memory"),
+  // Storage backends. "memory" = zero-setup dev mode (lost on restart).
+  // STORE holds users, chats and the billing ledger: Firestore in production.
+  STORE: z.enum(["memory", "firestore"]).default("memory"),
+  // KV holds the fast rate-limit / quota counters. "firestore" works for
+  // launch-level traffic; "redis" (e.g. Upstash) when you grow. See kv/firestore.ts.
+  KV: z.enum(["memory", "firestore", "redis"]).default("memory"),
   REDIS_URL: z.string().optional(),
+
+  // Firebase Admin credentials (same variables as the FORKSAI app).
+  // On Google Cloud Run / Firebase you can leave them empty: the service
+  // account of the machine is used automatically.
+  FIREBASE_PROJECT_ID: z.string().optional(),
+  FIREBASE_CLIENT_EMAIL: z.string().optional(),
+  FIREBASE_PRIVATE_KEY: z.string().optional(),
+  /**
+   * Prefix for every Firestore collection this service creates ("llm_users",
+   * "llm_conversations"...). Lets it share a Firebase project with another
+   * app (like FORKSAI, which already has a "users" collection) without clashes.
+   */
+  FIRESTORE_COLLECTION_PREFIX: z.string().default("llm_"),
 
   // Provider credentials. Empty string is treated as "not configured".
   OPENAI_API_KEY: z.string().optional(),
@@ -40,7 +55,12 @@ const EnvSchema = z.object({
   // --- Website ---
   /** Browser origins allowed to call the API, comma-separated (e.g. https://chat.example.com). */
   CORS_ORIGINS: z.string().default("http://localhost:3000,http://localhost:5173"),
-  /** Secret that verifies website login tokens (HS256 JWT, e.g. your Supabase JWT secret). */
+  /**
+   * Website logins are verified with Firebase Auth whenever Firebase is
+   * configured. AUTH_JWT_SECRET is a DEVELOPMENT shortcut only: it lets
+   * POST /v1/auth/dev-token issue test tokens so you can try the API without
+   * a Firebase login. Ignored in production.
+   */
   AUTH_JWT_SECRET: z.string().optional(),
 
   // --- Cost protection for YOU (the platform owner) ---
@@ -71,20 +91,22 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
   const env = parsed.data;
 
   // Cross-field rules zod can't express nicely above.
-  if (env.STORE === "postgres" && !env.DATABASE_URL) {
-    throw new Error("STORE=postgres requires DATABASE_URL");
-  }
   if (env.KV === "redis" && !env.REDIS_URL) {
     throw new Error("KV=redis requires REDIS_URL");
   }
   if (env.NODE_ENV === "production") {
     // Guard rails: dev conveniences must never reach production.
     if (env.STORE === "memory" || env.KV === "memory") {
-      throw new Error("Production must use STORE=postgres and KV=redis (memory state is lost on restart and not shared across instances)");
+      throw new Error("Production must use STORE=firestore and KV=firestore or redis (memory state is lost on restart and not shared across instances)");
     }
     if (env.ENABLE_MOCK_PROVIDER) {
       throw new Error("ENABLE_MOCK_PROVIDER must be false in production");
     }
   }
   return env;
+}
+
+/** True when this deployment talks to Firebase (data, counters or logins). */
+export function usesFirebase(env: Env): boolean {
+  return env.STORE === "firestore" || env.KV === "firestore" || !!env.FIREBASE_PROJECT_ID;
 }

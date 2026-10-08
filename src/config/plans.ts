@@ -157,7 +157,7 @@ export const PLANS: Record<PlanId, PlanLimits> = {
   },
   enterprise: {
     // Enterprise values are defaults; real contracts override them per org
-    // (see `org_limit_overrides` in db/schema.sql).
+    // (the `limitOverrides` field on the org doc in Firestore).
     id: "enterprise",
     displayName: "Enterprise",
     priceUsdPerMonth: 0, // negotiated

@@ -1,5 +1,5 @@
 /**
- * In-memory Store for local development and tests. Mirrors the Postgres
+ * In-memory Store for local development and tests. Mirrors the Firestore
  * behaviour closely enough to build the website against it with zero setup.
  * State is lost on restart.
  */

@@ -17,9 +17,9 @@
  * release the rest. Without it, 10 expensive requests started at the same
  * moment could each see "$1 left" and together spend $10.
  *
- * Redis counters here are a FAST MIRROR for enforcement. The durable source
- * of truth for billing is the `usage_ledger` table in Postgres; a periodic
- * reconciler job can rebuild the Redis counters from it (docs section 7).
+ * The KV counters here are a FAST MIRROR for enforcement. The durable source
+ * of truth for billing is the `llm_ledger` collection in Firestore; a periodic
+ * reconciler job can rebuild the counters from it (docs section 7).
  */
 import type { PlanLimits } from "../config/plans.js";
 import { AppError } from "../errors.js";

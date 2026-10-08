@@ -12,7 +12,8 @@ Several AI models (Claude, GPT, Gemini, and any others you add) work on the same
 - **Website-ready API:** login tokens, CORS, streaming progress over SSE, conversation history, usage meter endpoint, and a stop button that cancels model calls so you stop paying.
 - **Resilience:** timeouts, retries with backoff, per-model circuit breakers, graceful degradation when a vendor is down.
 - **Billing:** exact vendor token counts, integer micro-dollar money, append-only ledger, margin tracking.
-- **Ops:** Postgres schema, Redis rate limiting, Prometheus metrics, structured logs, Docker, graceful shutdown.
+- **Firebase:** Firestore stores users, chats and billing; Firebase Auth handles website logins (same setup as FORKSAI). Redis is optional, for later.
+- **Ops:** Prometheus metrics, structured logs, graceful shutdown. No Docker needed.
 
 ## Run it locally (no API keys needed)
 
@@ -36,11 +37,23 @@ curl -s localhost:8080/v1/chat \
 
 To use real models, put any of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY` in `.env`. A vendor is enabled only when its key is set. **Before using real keys, update the prices and model ids in `src/config/models.ts`** (they are placeholders) and set `PLATFORM_DAILY_BUDGET_USD` to what you can afford per day.
 
-### With Postgres and Redis (production-like)
+### With Firebase
 
-```bash
-docker compose up --build
-```
+1. Firebase console: create (or reuse) a project, enable **Firestore** and **Authentication > Google**.
+2. Project settings > Service accounts > **Generate new private key**. Copy `project_id`, `client_email` and `private_key` into `.env` as `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY` (the same variables FORKSAI uses).
+3. In `.env` set `STORE=firestore` and `KV=firestore`.
+4. Deploy the indexes and TTL policy: `npx firebase deploy --only firestore:indexes` (uses `firestore.indexes.json`).
+5. Read `firestore.rules` before touching your rules, especially if the project is shared with FORKSAI.
+
+Collections are all prefixed `llm_`, so sharing a project with FORKSAI is safe.
+
+### Deploying (no Docker needed)
+
+- **Google Cloud Run** (best fit with Firebase): `gcloud run deploy --source .`. No private key needed there.
+- **Render / Railway**: connect the GitHub repo; build `npm ci && npm run build`, start `npm start`.
+- Not Vercel: this is a long-running streaming server, and debates can exceed serverless time limits. Keep FORKSAI on Vercel and run this API separately.
+
+Details in [`docs/ARCHITECTURE.md` section 9.1](docs/ARCHITECTURE.md#91-where-to-deploy-no-docker-needed).
 
 ## Commands
 
@@ -48,14 +61,16 @@ docker compose up --build
 |---|---|
 | `npm run dev` | Start with auto-reload |
 | `npm test` | Unit + end-to-end tests (mock models, no network) |
+| `FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 npm test` | Also runs the Firestore tests, against the emulator (`npx firebase emulators:start --only firestore`) |
 | `npm run typecheck` | TypeScript check |
 | `npm run build && npm start` | Production build and run |
-| `npm run create-key -- <org_id>` | Generate a developer API key |
+| `npm run create-key -- <org_id>` | Generate a developer API key and save it to Firestore |
 
 ## Calling it from your website
 
 ```js
-// 1. Get your user's login token from your auth provider (Supabase, Firebase, Clerk...)
+// 1. Get the signed-in user's Firebase ID token (refreshes automatically)
+const token = await auth.currentUser.getIdToken();
 // 2. Send a message; keep conversation_id to continue the same chat
 const res = await fetch("https://api.yoursite.com/v1/chat", {
   method: "POST",
@@ -81,9 +96,11 @@ src/billing/             token estimates, money maths
 src/memory/              chat history trimming
 src/safety/              moderation, prompt-injection signals
 src/cache/               response cache
-src/store/, src/kv/      Postgres + Redis (and in-memory versions for dev)
+src/store/, src/kv/      Firestore (+ optional Redis), and in-memory versions for dev
+src/firebase.ts          Firebase Admin setup
 src/observability/       logs + Prometheus metrics
-db/schema.sql            database tables
+firestore.rules          keeps browsers out of the llm_ collections
+firestore.indexes.json   indexes + TTL policy for Firestore
 examples/chat.html       reference chat page
 test/                    tests
 ```

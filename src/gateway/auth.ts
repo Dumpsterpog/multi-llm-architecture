@@ -3,21 +3,26 @@
  *
  * Two kinds of caller, both sent as `Authorization: Bearer <token>`:
  *
- * 1. WEBSITE USERS (your ChatGPT-style site). The user logs in with your
- *    auth provider (Supabase, Firebase, Clerk, Auth0...). The browser sends
- *    that provider's JWT. We verify its signature and map its `sub` claim to
- *    a user + personal org (created on first login, free plan).
- *    This file verifies HS256 JWTs with a shared secret (Supabase's default).
- *    For providers that sign with RS256 + JWKS (Firebase, Clerk, Auth0),
- *    replace verifyJwt() with `jose`'s createRemoteJWKSet + jwtVerify.
+ * 1. WEBSITE USERS (your ChatGPT-style site). The user signs in with
+ *    Firebase Auth in the browser (Google sign-in etc.), the website calls
+ *    `await auth.currentUser.getIdToken()` and sends that token. We verify
+ *    it with the Firebase Admin SDK and map the user's uid to a user +
+ *    personal org (created on first login, free plan). Same pattern as
+ *    `adminAuth.verifyIdToken()` in the FORKSAI API.
  *
  * 2. DEVELOPERS using the API directly, with an API key "mlk_...".
  *    We hash the key and look the hash up (keys are never stored raw).
+ *
+ * Dev shortcut: outside production, HS256 tokens signed with AUTH_JWT_SECRET
+ * (issued by POST /v1/auth/dev-token) are accepted too, so you can test
+ * without a Firebase login. They are always rejected in production.
  *
  * NEVER trust a user id sent in the request body or query string. Identity
  * comes only from a verified token.
  */
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import type { Auth } from "firebase-admin/auth";
+import type { Env } from "../config/env.js";
 import { AppError } from "../errors.js";
 import type { Principal, Store } from "../store/types.js";
 
@@ -72,7 +77,39 @@ export function signJwt(claims: JwtClaims, secret: string): string {
   return `${header}.${payload}.${sig}`;
 }
 
-export async function authenticate(authHeader: string | undefined, store: Store, jwtSecret: string | undefined): Promise<Principal> {
+/** Verifies a website login token and returns who it belongs to. */
+export type WebTokenVerifier = (token: string) => Promise<{ uid: string; email: string | null }>;
+
+function tokenAlg(token: string): string | undefined {
+  try {
+    return (JSON.parse(Buffer.from(token.split(".")[0] ?? "", "base64url").toString()) as { alg?: string }).alg;
+  } catch {
+    return undefined;
+  }
+}
+
+export function createWebTokenVerifier(env: Env, firebaseAuth?: Auth): WebTokenVerifier {
+  const devSecret = env.NODE_ENV !== "production" ? env.AUTH_JWT_SECRET : undefined;
+
+  return async (token) => {
+    // Dev tokens are HS256; Firebase ID tokens are RS256. The header tells them apart.
+    if (tokenAlg(token) === "HS256") {
+      if (!devSecret) throw new AppError(401, "authentication_error", "Invalid token");
+      const c = verifyJwt(token, devSecret);
+      return { uid: c.sub, email: c.email ?? null };
+    }
+    if (!firebaseAuth) throw new AppError(401, "authentication_error", "Web login is not configured on this server");
+    try {
+      // Checks signature against Google's public keys, expiry, audience (your project) and issuer.
+      const decoded = await firebaseAuth.verifyIdToken(token);
+      return { uid: decoded.uid, email: decoded.email ?? null };
+    } catch {
+      throw new AppError(401, "authentication_error", "Invalid or expired login. Please sign in again.");
+    }
+  };
+}
+
+export async function authenticate(authHeader: string | undefined, store: Store, verifyWebToken: WebTokenVerifier): Promise<Principal> {
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : undefined;
   if (!token) throw new AppError(401, "authentication_error", "Missing Authorization: Bearer <token>");
 
@@ -82,7 +119,6 @@ export async function authenticate(authHeader: string | undefined, store: Store,
     return p;
   }
 
-  if (!jwtSecret) throw new AppError(401, "authentication_error", "Web login is not configured on this server");
-  const claims = verifyJwt(token, jwtSecret);
-  return store.upsertWebUser(claims.sub, claims.email ?? null);
+  const { uid, email } = await verifyWebToken(token);
+  return store.upsertWebUser(uid, email);
 }
