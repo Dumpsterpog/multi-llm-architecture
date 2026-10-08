@@ -8,7 +8,21 @@
  *
  * Nothing else in the codebase should read process.env directly.
  */
+import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { z } from "zod";
+
+/**
+ * Load the .env file in the current folder into process.env, if there is one.
+ * Real environment variables win over the file, so a host's settings
+ * (Render, Cloud Run...) always take precedence. In production there is
+ * usually no .env file at all, which is fine.
+ */
+export function loadDotEnvFile(path = ".env"): boolean {
+  if (!existsSync(path)) return false;
+  process.loadEnvFile(path);
+  return true;
+}
 
 // zod's coerce turns the string "8080" into the number 8080, etc.
 const boolish = z
@@ -91,6 +105,16 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
   const env = parsed.data;
 
   // Cross-field rules zod can't express nicely above.
+  // Zero-setup local testing: in development, with no AI keys set, use the
+  // free mock models, and let the demo page log in without configuring a
+  // secret. Neither ever applies in production (see the checks below).
+  if (env.NODE_ENV === "development") {
+    const hasProviderKey = !!(env.OPENAI_API_KEY || env.ANTHROPIC_API_KEY || env.GOOGLE_API_KEY);
+    if (!hasProviderKey && source.ENABLE_MOCK_PROVIDER === undefined) env.ENABLE_MOCK_PROVIDER = true;
+    // Random per run: demo logins simply expire when you restart the server.
+    env.AUTH_JWT_SECRET ??= randomBytes(32).toString("hex");
+  }
+
   if (env.KV === "redis" && !env.REDIS_URL) {
     throw new Error("KV=redis requires REDIS_URL");
   }

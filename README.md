@@ -21,9 +21,10 @@ Requires Node 20.10+.
 
 ```bash
 npm install
-cp .env.example .env      # works as-is with free mock models
 npm run dev
 ```
+
+No API keys or `.env` needed for this: with no AI keys set, it uses free mock models that reply with placeholder text, so you can see how everything works at no cost. When you're ready for real models, `cp .env.example .env` and fill it in.
 
 - Open **http://localhost:8080/demo** for a working chat page.
 - Or call the API:

@@ -7,18 +7,28 @@
  * never cut off a user's answer halfway (and never bill for it).
  */
 import { createApp } from "./app.js";
-import { loadEnv } from "./config/env.js";
+import { loadDotEnvFile, loadEnv } from "./config/env.js";
 
+const hadDotEnv = loadDotEnvFile();
 const env = loadEnv();
 const app = createApp(env);
 
 const providers = app.registry.configuredProviders();
+if (providers.length === 1 && providers[0] === "mock") {
+  app.logger.info("No AI provider keys set: using the free mock models (placeholder answers, no cost).");
+}
 if (providers.length === 0) {
   app.logger.warn("No model providers configured. Set provider API keys or ENABLE_MOCK_PROVIDER=true.");
 }
 
 await app.server.listen({ port: env.PORT, host: "0.0.0.0" });
-app.logger.info({ port: env.PORT, providers, store: env.STORE, kv: env.KV }, "multi-llm gateway listening");
+app.logger.info({ port: env.PORT, providers, store: env.STORE, kv: env.KV, dotEnvLoaded: hadDotEnv }, "multi-llm gateway listening");
+if (!hadDotEnv && env.NODE_ENV !== "production") {
+  app.logger.warn("No .env file found in this folder. Copy .env.example to .env (cp .env.example .env) and restart.");
+}
+if (env.NODE_ENV !== "production") {
+  app.logger.info(`Demo chat page: http://localhost:${env.PORT}/demo`);
+}
 
 let shuttingDown = false;
 for (const signal of ["SIGTERM", "SIGINT"] as const) {

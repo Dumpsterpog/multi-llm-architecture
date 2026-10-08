@@ -10,7 +10,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { FieldValue } from "firebase-admin/firestore";
-import { loadEnv } from "../src/config/env.js";
+import { loadDotEnvFile, loadEnv } from "../src/config/env.js";
 import { initFirebase } from "../src/firebase.js";
 import { API_KEY_PREFIX, hashApiKey } from "../src/gateway/auth.js";
 
@@ -20,6 +20,7 @@ if (!orgId) {
   process.exit(1);
 }
 
+loadDotEnvFile();
 const env = loadEnv();
 const { db } = initFirebase(env);
 const col = (c: string) => db.collection(`${env.FIRESTORE_COLLECTION_PREFIX}${c}`);

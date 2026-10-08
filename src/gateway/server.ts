@@ -257,12 +257,15 @@ export function buildServer(d: ServerDeps) {
   });
 
   // --- Dev-only login: lets you build the website before wiring a real auth provider ---
-  if (d.env.NODE_ENV !== "production" && d.env.AUTH_JWT_SECRET) {
+  if (d.env.NODE_ENV !== "production") {
     // Reference chat page (examples/chat.html), served same-origin so no CORS setup is needed.
+    // Served even without AUTH_JWT_SECRET: the page then explains how to turn dev login on.
     app.get("/demo", async (_req, reply) => {
       const html = await readFile(join(process.cwd(), "examples", "chat.html"), "utf8");
       return reply.type("text/html; charset=utf-8").send(html);
     });
+  }
+  if (d.env.NODE_ENV !== "production" && d.env.AUTH_JWT_SECRET) {
     app.post("/v1/auth/dev-token", async (req) => {
       const b = DevTokenBody.parse(req.body ?? {});
       const token = signJwt({ sub: b.user_id, email: b.email, exp: Math.floor(Date.now() / 1000) + 24 * 3600 }, d.env.AUTH_JWT_SECRET!);
