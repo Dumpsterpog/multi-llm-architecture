@@ -6,7 +6,9 @@ Several AI models (Claude, GPT, Gemini, and any others you add) work on the same
 
 ## What's inside
 
-- **4 ways for models to collaborate:** router (pick the best single model), parallel + synthesis, multi-round debate, and draft/critique/refine. `auto` picks one per message.
+- **A supervisor model (Gemini Flash) reads every message first:** simple messages go straight to one model; the rest go to one of three orchestration tiers (lite, standard, max), capped by the user's plan.
+- **4 ways for models to collaborate:** router (best single model), parallel + synthesis, multi-round debate, and draft/critique/refine.
+- **Step-by-step flow chart:** [`docs/REQUEST_FLOW.md`](docs/REQUEST_FLOW.md) shows everything that happens to a message, with the code behind each step.
 - **Cost control at every level:** per-request spending cap, tokens per minute, daily token quota, monthly spend cap per customer, and a **platform-wide daily budget** that protects your own bill.
 - **Plans:** free / pro / team / enterprise, each with its own limits (`src/config/plans.ts`).
 - **Website-ready API:** login tokens, CORS, streaming progress over SSE, conversation history, usage meter endpoint, and a stop button that cancels model calls so you stop paying.
@@ -90,7 +92,8 @@ const res = await fetch("https://api.yoursite.com/v1/chat", {
 docs/ARCHITECTURE.md     full system design, read this first
 src/config/              models + prices, plans + limits, env validation
 src/gateway/             HTTP routes, auth, the request pipeline
-src/orchestrator/        strategies, prompts, per-request budget
+src/orchestrator/        supervisor, dispatch, strategies, prompts, per-request budget
+src/config/tiers.ts      direct / lite / standard / max definitions
 src/providers/           Claude / GPT / Gemini / mock adapters, retries, breakers
 src/limits/              rate limits, quotas, spend reservations
 src/billing/             token estimates, money maths

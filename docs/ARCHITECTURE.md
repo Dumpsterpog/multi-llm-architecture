@@ -212,7 +212,29 @@ Each model has a stable **internal id** (`claude-sonnet`) separate from the **ve
 
 ## 5. How the models collaborate (strategies)
 
-Four strategies trade quality against cost and speed. `auto` picks one per request.
+### 5.0 The supervisor and the three tiers
+
+Before any orchestration, a cheap **supervisor** model (Gemini Flash; `src/orchestrator/supervisor.ts`) reads the message and decides:
+
+- **direct**: simple message, one fast model answers, no orchestration.
+- **orchestrate**, with a complexity that maps to a tier: simple = **lite**, medium = **standard**, complex = **max**.
+
+The customer's plan sets the highest tier they can reach (`maxOrchestrationTier`: Free = lite, Pro = standard, Team and Enterprise = max), and the supervisor may choose a lower one when the message needs less (`SUPERVISOR_MAY_DOWNGRADE` in `src/config/tiers.ts`; set it to `false` to always run the plan's own tier). The cap is enforced in plain code (`buildDispatch()` in `src/orchestrator/dispatch.ts`), so a wrong or manipulated supervisor can never exceed the plan.
+
+| Route | Models | Collaboration | Reachable on |
+|---|---|---|---|
+| direct | 1 fast model, with fallbacks | single answer | every plan |
+| lite | 2 fast models, fast model merges | parallel + synthesis | Free and up |
+| standard | 3 models (one per vendor), balanced model merges | parallel; critique for writing and code | Pro and up |
+| max | 3 flagship models, flagship merges | debate up to 3 rounds; critique for writing | Team, Enterprise |
+
+The supervisor sees at most 6,000 characters, writes at most 120 tokens, has an 8 second timeout and no retries, and runs under the same per-request budget as everything else. If it fails for any reason, free keyword rules (`heuristicDecision()`) route the message instead. Clients can still pick a strategy or models explicitly (manual mode), which skips the supervisor.
+
+The full step-by-step flow, with the function behind each step, is in [`REQUEST_FLOW.md`](REQUEST_FLOW.md).
+
+### 5.1 The strategies
+
+Four strategies trade quality against cost and speed. The tiers above choose between them.
 
 | Strategy | Calls (N models, R rounds) | Latency | Best for |
 |---|---|---|---|
